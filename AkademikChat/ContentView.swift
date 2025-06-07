@@ -1,6 +1,9 @@
 import SwiftUI
 import Network
 
+// Handle password hashing
+import CryptoKit
+
 struct ContentView: View {
     var onOpenChat: (String) -> Void
 
@@ -49,11 +52,21 @@ struct ContentView: View {
     }
 
     func connect() {
-        guard let p = UInt16(port) else {
+        guard let p = UInt16(port),
+              let portNum = NWEndpoint.Port(rawValue: p) else {
             status = "Невірний порт"
             return
         }
-        let c = NWConnection(host: ip, port: p, using: .tcp)
+        // Configure TLS parameters
+        let tls = NWProtocolTLS.Options()
+        sec_protocol_options_set_min_tls_protocol_version(
+            tls.securityProtocolOptions,
+            .TLSv12
+        )
+        let tcp = NWProtocolTCP.Options()
+        let params = NWParameters(tls: tls, tcp: tcp)
+
+        let c = NWConnection(host: NWEndpoint.Host(ip), port: portNum, using: params)
         ChatSession.shared.configure(username: username, connection: c)
 
         c.stateUpdateHandler = { newState in
@@ -77,7 +90,9 @@ struct ContentView: View {
                 if let d = data,
                    String(data: d, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) == "1.0.0" {
-                    let creds = ["username": username, "password": password]
+                    let hashed = Credentials.hash(password)
+                    Credentials.storeHashedPassword(password)
+                    let creds = ["username": username, "password": hashed]
                     let jd = try! JSONEncoder().encode(creds) + Data("\n".utf8)
                     c.send(content: jd) { _ in
                         c.receive(minimumIncompleteLength: 1, maximumLength: 1024) { resp, _, _, _ in
