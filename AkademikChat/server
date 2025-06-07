@@ -1,0 +1,203 @@
+import socket
+import threading
+import json
+import os
+import uuid
+import base64
+from datetime import datetime
+import bcrypt  # нове для хешування паролів
+
+HOST = '192.168.1.238'
+PORT = 1077
+VERSION = "1.0.0"
+USERS_FILE = "users.json"
+BUFFER_SIZE = 4096
+
+clients = {}      # socket -> username
+nicknames = {}    # username -> nickname
+
+for d in ('chats', 'files', 'offline'):
+    os.makedirs(d, exist_ok=True)
+
+def load_users():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+users = load_users()
+
+def save_chat(user_id, message):
+    path = os.path.join("chats", f"{user_id}.txt")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(message + "\n")
+
+def save_offline(user_id, packet):
+    path = os.path.join("offline", f"{user_id}.json")
+    arr = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            arr = json.load(f)
+    arr.append(packet)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(arr, f, ensure_ascii=False)
+
+def deliver_offline(username, sock):
+    path = os.path.join("offline", f"{username}.json")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            arr = json.load(f)
+        for pkt in arr:
+            sock.send((json.dumps(pkt) + "\n").encode())
+        os.remove(path)
+
+def handle_client(sock, addr):
+    print(f"[CONNECT] {addr}")
+    try:
+        ver = sock.recv(1024).decode().strip()
+        if ver != "VERSION_REQUEST":
+            sock.close()
+            return
+        sock.send((VERSION + "\n").encode())
+
+        creds_raw = sock.recv(BUFFER_SIZE).decode()
+        creds = json.loads(creds_raw)
+        user = creds.get("username")
+        pwd = creds.get("password")
+
+        if user in users:
+            stored_hash = users[user]["password"].encode()
+            if bcrypt.checkpw(pwd.encode(), stored_hash):
+                clients[sock] = user
+                sock.send(("AUTH_SUCCESS\n").encode())
+                deliver_offline(user, sock)
+            else:
+                sock.send(("AUTH_FAIL\n").encode())
+                sock.close()
+                return
+        else:
+            sock.send(("AUTH_FAIL\n").encode())
+            sock.close()
+            return
+
+        buffer = ""
+        while True:
+            chunk = sock.recv(BUFFER_SIZE).decode()
+            if not chunk:
+                break
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                action = msg.get("action")
+                if action == "private_message":
+                    send_private(user, msg["to"], msg["text"])
+                elif action == "send_file":
+                    send_file(user, msg["to"], msg["filename"], msg["filedata"])
+                elif action == "group_message":
+                    send_group(user, msg["group"], msg["text"])
+                elif action == "search_user":
+                    q = msg.get("query", "").lower()
+                    result = [
+                        {"userId": uid}
+                        for uid, info in users.items()
+                        if q in uid.lower()
+                    ]
+                    resp = {"action": "search_result", "users": result}
+                    sock.send((json.dumps(resp) + "\n").encode())
+                elif action == "fetch_offline":
+                    deliver_offline(user, sock)
+    except ConnectionResetError:
+        print(f"[DISCONNECT UNEXPECTED] {addr}")
+    except Exception as e:
+        print(f"[ERROR with {addr}] {e}")
+    finally:
+        print(f"[DISCONNECT] {addr}")
+        if sock in clients:
+            del clients[sock]
+        sock.close()
+
+def send_private(frm, to, text):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    message_id = uuid.uuid4().hex
+
+    packet = {
+        "action": "private_message",
+        "message_id": message_id,
+        "from": frm,
+        "to": to,
+        "text": text,
+        "time": ts
+    }
+
+    save_chat(to, f"{ts} {frm}: {text}")
+    save_chat(frm, f"{ts} To {to}: {text}")
+    data = json.dumps(packet) + "\n"
+
+    for s, u in clients.items():
+        if u == to:
+            try:
+                s.send(data.encode())
+            except:
+                save_offline(to, packet)
+            return
+    save_offline(to, packet)
+
+def send_group(frm, grp, text):
+    path = os.path.join("groups", f"{grp}.json")
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        members = json.load(f).get("members", [])
+    for m in members:
+        send_private(frm, m, text)
+
+def send_file(frm, to, filename, filedata):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    message_id = uuid.uuid4().hex
+
+    packet = {
+        "action": "file",
+        "message_id": message_id,
+        "from": frm,
+        "to": to,
+        "filename": filename,
+        "filedata": filedata,
+        "time": ts
+    }
+
+    save_chat(to, f"{ts} {frm}: [file] {filename}")
+    save_chat(frm, f"{ts} To {to}: [file] {filename}")
+    data = json.dumps(packet) + "\n"
+    for s, u in clients.items():
+        if u == to:
+            try:
+                s.send(data.encode())
+            except:
+                save_offline(to, packet)
+            return
+    save_offline(to, packet)
+
+def start_server():
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((HOST, PORT))
+    server.listen()
+    print(f"[SERVER STARTED] {HOST}:{PORT}")
+    try:
+        while True:
+            client_sock, addr = server.accept()
+            threading.Thread(
+                target=handle_client,
+                args=(client_sock, addr),
+                daemon=True
+            ).start()
+    finally:
+        server.close()
+
+if __name__ == "__main__":
+    start_server()
